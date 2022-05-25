@@ -1,4 +1,6 @@
 import Data.Char
+import System.Environment
+import Control.Exception (SomeException, try)
 
 -- Data type expressing part of data stream processing
 -- eg. string
@@ -41,6 +43,9 @@ finishM opt = opt >>= \(Part m r) ->
                         case r of
                             [] -> Just m
                             _ -> Nothing
+ 
+finishM' :: OptPart [a] b -> Maybe b
+finishM' opt = opt >>= \(Part m r) -> Just m
 
 -- Create matcher for list, using function that decide
 -- for one element if it should be put.
@@ -111,6 +116,7 @@ anyM = unitM (\_ -> True)
 
 -- Then we have basic syntax
 charRgxSyntax = [ matchConv (unitM (== '.')) anyM,
+                  matchConv (stringM "\\n") (unitM (== '\n')),
                   matchConv (stringM "\\s") (unitM isSpace),
                   matchConv (stringM "\\d") (unitM isDigit),
                   matchConv (stringM "\\w") (unitM isPosixAlpha),
@@ -137,6 +143,7 @@ charRgxWithNeg = withMods [('!', neg),
 -- We implement basic modifiers: *, + and ?
 regexSyntax = withMods [('*', rept'),
                         ('+', rept),
+                        ('^', quietM),
                         ('?', opt)] charRgxWithNeg
 
 -- We want also group code with parenthesis
@@ -165,58 +172,76 @@ regex' syntax finalizer src =
 regex = regex' regexSyntax flatM
 regexG = regex' groupingSyntax (\x->x)
 
+-- Having regex, I want to be able to finalize Matcher usage
+-- and separate result.
 
--- Then we want to lex. So we will work with Symbols
--- Lexem is Matcher for Symbols
-type Name = [Char]
-data Symbol = Symbol Name [Char]
-    deriving Show
+usage = do 
+    putStrLn "cte\nusage: cte <file to open>"
+    return Nothing
 
-type Lexem = Matcher [Char] [Symbol]
+fileContent f = do
+    fh <- try $ readFile f :: IO(Either SomeException [Char])
+    case fh of
+        Left x -> do
+            putStrLn $ "Can't open file " ++ f ++ ": " ++ (show x)
+            return Nothing
+        Right txt -> return $ Just txt
+        
+replSubject = do
+    args <- getArgs
+    case args of
+        [] -> usage
+        [f] -> fileContent f
+        _ -> usage
 
--- lexer is function that uses Lexem list to transform a string
--- into list of symbols; but it appears that parser is the same
--- but the type of Matcher. So I call it processor
-processor :: [Matcher [a] [b]] -> [a] -> Maybe [b]
-processor [] _ = Nothing
-processor lx inp = finishM ((rept $ alt lx) inp)
+class HasNeutral x where
+    neutral :: x
 
--- to create lexem
-type Regex = [Char]
-lexem :: Regex -> Name -> Lexem
-lexem rgx name inp = regex rgx >>= \t -> t inp $> \[v] -> [Symbol name v]
+instance HasNeutral () where
+    neutral = ()
 
-replLex = processor [
-    quietM $ lexem "\\s+" "space",
-    lexem "\\d+" "num",
-    lexem "\"`\"!*\"`" "string", 
-    lexem "'`'!*'`" "string", 
-    lexem "\\w+" "word" ]
+instance HasNeutral (Maybe a) where
+    neutral = Nothing
 
--- Then next step is parsing. In terms of above
--- Parser is Matcher for trees (nodes are keys, leafs are values)
--- from symbols.
+(&>=) :: HasNeutral b => IO (Maybe a) -> (a -> IO b) -> IO b
+a &>= b = a >>= \x -> case x of
+                        Just y -> b y
+                        _ -> return $ neutral
 
-data Tree a = Leaf a
-            | Node a [Tree a]
+matchOne :: Maybe (Matcher [Char] [[Char]]) -> [Char] -> Maybe [Char]
+matchOne rgx input = rgx >>= \tst -> finishM(tst input)
+                     >>= \x -> Just $ foldl (++) "" x
 
-instance Show a => Show (Tree a) where
-    show (Leaf a) = show a
-    show (Node k v) = show k ++ " -> " ++ show v
+find :: Maybe (Matcher [a] [b]) -> [a] -> Maybe [b]
+find rgx [] = Nothing
+find rgx input = rgx >>= \tst -> case (tst input) of
+                                    Just (Part m r) -> Just $ m ++ (find rgx r >>| [])
+                                    Nothing -> case (find rgx (drop 1 input)) of
+                                                  Nothing -> Nothing
+                                                  x -> x
+                                    
 
-type Parser a b = Matcher [a] [Tree b]
-token :: [Name] -> [Name] -> Parser Symbol [Char]
-token types keys inp =
-    let isType expected (Symbol t _) = expected == t
-        selector :: Matcher [Symbol] [[Symbol]]
-        selector = mseq $ map (\x -> unitM $ isType x) types
-        getVal (Symbol _ val) = val
-        matcher :: Matcher [Symbol] [[Char]]
-        matcher = \x -> selector x $> \syms -> map getVal (foldl (++) [] syms)
-        zipper :: [[Char]] -> [Tree [Char]]
-        zipper values = map (\(key,val) -> Node key [Leaf val])
-                            (zip keys values)
-    in matcher inp $> zipper
+type Buffer = String
+type BufferAct = Buffer -> IO (Maybe String)
 
-replPars x = replLex x >>= \x' -> processor [
-    token ["word", "string"] ["fun", "arg"]] x'
+repl :: BufferAct
+repl input =
+    let rgx input = matchOne (regex "/^/!+/^") input
+    in getLine >>= \line -> return $ case (rgx line) of
+                                        Nothing -> Just $ "can't compile " ++ line
+                                        Just tst -> case (find (regex tst) input) of
+                                                        Nothing -> Just $ ":( <" ++ tst ++ ">"
+                                                        Just ms -> Just $ foldl (\a -> \v -> a ++ "\n" ++ v)
+                                                                           (head ms) (drop 1 ms)
+
+reptIO :: BufferAct -> (String -> IO()) -> (Buffer -> IO ())
+reptIO inio outio buff = do
+    step <- inio buff
+    case step of
+        Nothing -> return ()
+        Just x -> do
+            outio x
+            reptIO inio outio buff
+
+main = replSubject &>= reptIO repl putStrLn
+
